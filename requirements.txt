@@ -1,0 +1,12 @@
+pandas>=1.5
+numpy>=1.23
+scipy>=1.9
+geopandas>=0.12
+shapely>=2.0
+
+# Only needed for Dash server version (climate_map_dash.py):
+# dash>=2.14
+# plotly>=5.18
+
+# Only needed for desktop .exe wrapper (launch.pyw):
+# pywebview>=4.0
