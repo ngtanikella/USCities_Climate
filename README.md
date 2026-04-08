@@ -20,7 +20,7 @@ Interactive U.S. climate normals map built from NOAA 1991–2020 monthly station
 
 ### 1. Get the data
 
-All data is uploaded in the "Data" folder
+All data is uploaded in the "Data" folder. Alternatively:
 **Climate data** 
 Download NOAA 1991–2020 Monthly Climate Normals (by-station CSVs):
 - Go to [NOAA Climate Normals](https://www.ncei.noaa.gov/products/land-based-station/us-climate-normals)
