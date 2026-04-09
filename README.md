@@ -38,11 +38,11 @@ pip install pandas numpy scipy geopandas shapely
 python build_climate_app.py
 ```
 
-This generates a self-contained **`climate_map.html`** (~3–5 MB) in the same directory.
+This generates a self-contained **`USclimate_map.html`** (~3–5 MB) in the same directory.
 
 ### 3. Open it
 
-**Option A** — Double-click `climate_map.html` in any modern browser.
+**Option A** — Double-click `USclimate_map.html` in any modern browser.
 
 **Option B** — Run as a desktop app:
 ```bash
@@ -55,21 +55,12 @@ python launch.pyw
 pip install pywebview pyinstaller
 pyinstaller --onefile --noconsole launch.pyw
 ```
-Then distribute `launch.exe` + `climate_map.html` together.
+Then distribute `launch.exe` + `USclimate_map.html` together.
 
-### Alternative: Dash server version
-
-If you prefer a Python-server-based app (useful for development or adding more features):
-
-```bash
-pip install pandas numpy dash plotly scipy geopandas shapely
-python climate_map_dash.py
-# Open http://127.0.0.1:8050
-```
 
 ## Configuration
 
-Edit the top of `build_climate_app.py` (or `climate_map_dash.py`):
+Edit the top of `build_USclimate_app.py`
 
 ```python
 CLIMATE_DIR  = r"path/to/your/station/csvs"
@@ -99,8 +90,7 @@ extreme_penalty = (f[mm] * 1) + (h[mm] * 2.5)
 
 ```
 USCities_Climate/
-├── build_climate_app.py   # Build script: NOAA data → standalone HTML
-├── climate_map_dash.py    # Alternative: Dash-based server version
+├── build_USclimate_app.py   # Build script: NOAA data → standalone HTML
 ├── launch.pyw             # Desktop wrapper (pywebview)
 ├── requirements.txt       # Python dependencies
 ├── LICENSE                # MIT License

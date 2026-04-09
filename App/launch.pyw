@@ -6,10 +6,10 @@ Requires:  pip install pywebview
 """
 import os, sys, webview
 
-html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "climate_map.html")
+html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "USclimate_map.html")
 
 if not os.path.exists(html_path):
-    print(f"ERROR: {html_path} not found. Run build_climate_app.py first.")
+    print(f"ERROR: {html_path} not found. Run build_USclimate_app.py first.")
     sys.exit(1)
 
 webview.create_window(

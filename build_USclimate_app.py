@@ -29,7 +29,7 @@ from shapely.ops import voronoi_diagram, unary_union
 import geopandas as gpd
 
 # ─── USER CONFIG ────────────────────────────────────────────────────────────
-CLIMATE_DIR   = r"C:\Users\nag55\Downloads\Climate\Multi"
+CLIMATE_DIR   = r"C:\Users\nag55\Downloads\Climate\USClimateData"
 CITIES_CSV    = r"C:\Users\nag55\Downloads\Climate\uscities.csv"
 CITY_SPACING  = 0.5        # ±degrees for deduplication (0.75→~896 cities)
 OUTPUT_HTML   = None        # None = same folder as CITIES_CSV
