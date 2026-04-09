@@ -84,14 +84,14 @@ CITY_SPACING = 0.75   # ±degrees deduplication (0.75→~896 cities, 1.0→~558)
 | ±0.50   | ~1,673 | Fine        | ~5 min     |
 
 Edit the Comfort Index based on your preferences . 
-Personally, I prefer 55-70F (daily mean), colder rather than hotter, low rain, low humidity, >32F and <90F, Where each city starts with a score of 100, and penalties are as follows: 
-temp_penalty = (cold_diff * 0.8 + cold_diff**2 * 0.01 + cold_diff_extra**2 * 0.01) + (hot_diff * 0.9 + hot_diff**2 * 0.03 +   hot_diff_extra**2 * 0.06) 
-  #cold_diff is difference from 55F, cold_diff_extra is difference from 30F. hot_diff is difference from 70, hot_diff_extra is difference from 90F.
+Personally, I prefer 50-70F (daily mean), colder rather than hotter, low rain, low humidity, >32F and <90F, Where each city starts with a score of 100, and penalties are as follows: 
+temp_penalty = (cold_diff * 0.8 + cold_diff**2 * 0.01 + cold_diff_extra**2 * 0.01) + (hot_diff * 0.8 + hot_diff**2 * 0.03 + hot_diff_extra**2 * 0.06)
+  #cold_diff is difference from 50F, cold_diff_extra is difference from 30F. hot_diff is difference from 70, hot_diff_extra is difference from 90F.
 rain_penalty = np.maximum(0, p[mm] - 2.0) * 2.0
   #the first 2 inches of rain per month are no penalized, but every inch of rain is penalized by 2 points.
 muggy_penalty = np.maximum(0, t[mm] - 70) * np.maximum(0, 20 - dtr[mm]) * 0.4
   #hudidity is panlized
-extreme_penalty = (f[mm] * 0.5) + (h[mm] * 2.5)
+extreme_penalty = (f[mm] * 1) + (h[mm] * 2.5)
   #Days below 32F and above 90F are penalized
 
 

@@ -31,7 +31,7 @@ import geopandas as gpd
 # ─── USER CONFIG ────────────────────────────────────────────────────────────
 CLIMATE_DIR   = r"C:\Users\nag55\Downloads\Climate\Multi"
 CITIES_CSV    = r"C:\Users\nag55\Downloads\Climate\uscities.csv"
-CITY_SPACING  = 0.75        # ±degrees for deduplication (0.75→~896 cities)
+CITY_SPACING  = 0.5        # ±degrees for deduplication (0.75→~896 cities)
 OUTPUT_HTML   = None        # None = same folder as CITIES_CSV
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -45,7 +45,6 @@ ANNUAL_SUM = {"MLY-PRCP-NORMAL","MLY-SNOW-NORMAL","MLY-HTDD-NORMAL","MLY-CLDD-NO
               "MLY-TMIN-AVGNDS-LSTH032","MLY-TMAX-AVGNDS-GRTH090",
               "MLY-PRCP-AVGNDS-GE010HI","MLY-SNOW-AVGNDS-GE010TI","MLY-SNWD-AVGNDS-GE001WI"}
 
-# Short keys for compact JSON
 KEY_MAP = {
     "MLY-TAVG-NORMAL":"tavg","MLY-TMAX-NORMAL":"tmax","MLY-TMIN-NORMAL":"tmin",
     "MLY-DUTR-NORMAL":"dutr","MLY-PRCP-NORMAL":"prcp","MLY-SNOW-NORMAL":"snow",
@@ -56,7 +55,7 @@ KEY_MAP = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DATA PROCESSING (reused from v8)
+# DATA PROCESSING
 # ═══════════════════════════════════════════════════════════════════════════
 
 def load_stations(climate_dir):
@@ -162,7 +161,6 @@ def interpolate_missing(merged, stations):
                 merged.at[midx,col] = vv[dd==0][0] if (dd==0).any() else np.average(vv, weights=1.0/dd)
                 filled += 1
     print(f"  Filled {filled}/{total}.")
-    # Recompute annual
     keys = merged[merged["month"]!=0].drop_duplicates(subset=["city","state"])[
         ["city","state","lat","lng","population","matched_station","elevation_ft"]]
     ann = []
@@ -180,14 +178,27 @@ def calc_comfort(merged):
     print("Calculating Comfort Index...")
     t = merged["MLY-TAVG-NORMAL"].fillna(65)
     p = merged["MLY-PRCP-NORMAL"].fillna(0)
+    dtr = merged.get("MLY-DUTR-NORMAL", pd.Series(20, index=merged.index)).fillna(20)
     f = merged["MLY-TMIN-AVGNDS-LSTH032"].fillna(0)
     h = merged["MLY-TMAX-AVGNDS-GRTH090"].fillna(0)
+
     mm = merged["month"] != 0
     ci = pd.Series(index=merged.index, dtype=float)
-    ci[mm] = np.clip(100 - np.maximum(0,50-t[mm])*3 - np.maximum(0,t[mm]-80)*3 - p[mm]*5 - (f[mm]+h[mm])*2, 0, 100)
+    # Change equations based on preferences. I prefer 50-70, colder rather than hotter, low rain, low humidity, >32F and <90F.
+    cold_diff = np.maximum(0, 50 - t[mm])
+    hot_diff  = np.maximum(0, t[mm] - 70)
+    cold_diff_extra = np.maximum(0, 30 - t[mm])   # Extra penalty for very cold
+    hot_diff_extra = np.maximum(0, t[mm] - 90)    # Extra penalty for very hot
+    temp_penalty = (cold_diff * 0.8 + cold_diff**2 * 0.01 + cold_diff_extra**2 * 0.01) + (hot_diff * 0.8 + hot_diff**2 * 0.03 + hot_diff_extra**2 * 0.06)
+    rain_penalty = np.maximum(0, p[mm] - 2.0) * 2.0
+    muggy_penalty = np.maximum(0, t[mm] - 70) * np.maximum(0, 20 - dtr[mm]) * 0.4
+    extreme_penalty = (f[mm] * 1) + (h[mm] * 2.5)
+
+    ci[mm] = np.clip(100 - temp_penalty - rain_penalty - muggy_penalty - extreme_penalty, 0, 100)
     merged["COMFORT-INDEX"] = ci
+
     for (c,s), grp in merged[mm].groupby(["city","state"]):
-        idx = merged[(merged["city"]==c)&(merged["state"]==s)&(~mm)].index
+        idx = merged[(merged["city"]==c)&(merged["state"]==s)&(merged["month"]==0)].index
         if len(idx): merged.loc[idx,"COMFORT-INDEX"] = grp["COMFORT-INDEX"].mean()
     return merged
 
@@ -200,7 +211,7 @@ def get_us_border():
     for url in ["https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json",
                 "https://eric.clst.org/assets/wiki/uploads/Stuff/gz_2010_us_040_00_500k.json"]:
         try:
-            gdf = gpd.read_file(url); print(f"    OK")
+            gdf = gpd.read_file(url); print("    OK")
             us = unary_union(gdf.geometry)
             try: gpd.GeoDataFrame(geometry=[us],crs=gdf.crs).to_file(cache,driver="GeoJSON")
             except: pass
@@ -234,7 +245,7 @@ def build_voronoi(lats, lngs, us_border):
     return {"type":"FeatureCollection","features":feats}
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CONVERT TO COMPACT JSON
+# COMPACT JSON
 # ═══════════════════════════════════════════════════════════════════════════
 
 def rnd(v, d=1):
@@ -242,38 +253,22 @@ def rnd(v, d=1):
     return round(v, d)
 
 def build_json_data(merged):
-    """Convert merged DataFrame into compact JS-friendly structure."""
     print("Building compact JSON...")
     cities_json = []
     annual = merged[merged["month"]==0].reset_index(drop=True)
-
     for i, (_, ar) in enumerate(annual.iterrows()):
-        city_obj = {
-            "c": ar["city"], "s": ar["state"],
-            "la": round(ar["lat"],4), "lo": round(ar["lng"],4),
-            "p": int(ar["population"]),
-            "el": rnd(ar["elevation_ft"],0),
-            "m": {},  # monthly data
-            "a": {},  # annual data
-        }
-        # Annual
-        for col, key in KEY_MAP.items():
-            city_obj["a"][key] = rnd(ar[col])
-        city_obj["a"]["ci"] = rnd(ar.get("COMFORT-INDEX", np.nan))
-
-        # Monthly (1-12)
+        obj = {"c":ar["city"],"s":ar["state"],"la":round(ar["lat"],4),"lo":round(ar["lng"],4),
+               "p":int(ar["population"]),"el":rnd(ar["elevation_ft"],0),"m":{},"a":{}}
+        for col, key in KEY_MAP.items(): obj["a"][key] = rnd(ar[col])
+        obj["a"]["ci"] = rnd(ar.get("COMFORT-INDEX", np.nan))
         monthly = merged[(merged["city"]==ar["city"])&(merged["state"]==ar["state"])&
                          (merged["month"]>=1)&(merged["month"]<=12)].sort_values("month")
         for _, mr in monthly.iterrows():
-            mo = int(mr["month"])
             md = {}
-            for col, key in KEY_MAP.items():
-                md[key] = rnd(mr[col])
+            for col, key in KEY_MAP.items(): md[key] = rnd(mr[col])
             md["ci"] = rnd(mr.get("COMFORT-INDEX", np.nan))
-            city_obj["m"][str(mo)] = md
-
-        cities_json.append(city_obj)
-
+            obj["m"][str(int(mr["month"]))] = md
+        cities_json.append(obj)
     print(f"  {len(cities_json)} cities serialized.")
     return cities_json
 
@@ -285,120 +280,375 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>U.S. Climate Normals Map (1991–2020)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>U.S. Climate Normals Map (1991-2020)</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
 <style>
+:root{
+  --red:#d32f2f;
+  --purple:#7b1fa2;
+  --bg:#f4f5f7;
+  --card:#fff;
+  --border:#e0e0e0;
+  --text:#2c3e50;
+  --muted:#888;
+}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:#f4f5f7;height:100vh;overflow:hidden;display:flex;flex-direction:column}
-#header{text-align:center;padding:3px 0 2px;background:#fff;border-bottom:1px solid #e0e0e0}
-#header h1{font-size:20px;color:#2c3e50;margin:0}
-#header .sub{font-size:11px;color:#888;margin:2px 0 0}
-#controls{display:flex;justify-content:center;align-items:flex-end;gap:14px;padding:4px 16px;
-  background:#fff;border-bottom:1px solid #e0e0e0;flex-wrap:wrap}
-.ctrl{display:flex;flex-direction:column}
-.ctrl label{font-size:11px;font-weight:600;color:#555;margin-bottom:2px}
-.ctrl select,.ctrl input{font-size:13px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;background:#fff}
-.ctrl select{cursor:pointer} .ctrl input{width:180px}
-#city-btns{display:flex;align-items:center;gap:4px}
-#city-btns button{background:none;border:none;cursor:pointer;font-size:18px;padding:2px 4px;border-radius:4px}
-#city-btns button:hover{background:#eee}
-#main{display:flex;flex:1;overflow:hidden}
-#map-wrap{flex:3;position:relative}
-#map{height:100%;width:100%}
-#panel{flex:1;min-width:320px;max-width:420px;display:flex;flex-direction:column;
-  background:#fafafa;border-left:1px solid #e0e0e0;overflow-y:auto}
-#panel-title{text-align:center;font-weight:700;font-size:13px;color:#2c3e50;
-  padding:8px 8px 4px;min-height:24px;line-height:1.4}
-#chart{flex:1;min-height:320px}
-#histogram{height:160px;margin:4px 8px 8px;background:#f0f1f3;border-radius:6px}
-#footer{text-align:center;font-size:10px;color:#999;padding:3px 0;background:#fff;border-top:1px solid #e0e0e0}
-#footer a{color:#777}
-#stats{text-align:center;font-size:11px;color:#666;padding:2px 0;background:#fff;border-top:1px solid #eee}
-.legend{position:absolute;bottom:30px;left:10px;background:rgba(255,255,255,0.92);
-  padding:8px 12px;border-radius:6px;font-size:11px;box-shadow:0 1px 4px rgba(0,0,0,0.2);z-index:1000}
-.legend .grad{height:12px;width:180px;border-radius:2px;margin:4px 0}
-.legend .labels{display:flex;justify-content:space-between;font-size:10px;color:#555}
 
-/* Datalist/search styling */
-#searchA,#searchB{width:170px}
-.city-a{color:#d32f2f} .city-b{color:#7b1fa2}
+/* Desktop stays app-like; mobile gets natural page scrolling */
+html,body{
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  background:var(--bg);
+  min-height:100%;
+}
+body{color:var(--text)}
+
+/* ── DESKTOP: side-by-side layout ── */
+#app{
+  display:flex;
+  flex-direction:column;
+  min-height:100vh;
+}
+#header{
+  text-align:center;
+  padding:4px 0 2px;
+  background:var(--card);
+  border-bottom:1px solid var(--border);
+  flex-shrink:0;
+}
+#header h1{
+  font-size:19px;
+  color:var(--text);
+  margin:0;
+}
+#controls{
+  display:flex;
+  justify-content:center;
+  align-items:flex-end;
+  gap:12px;
+  padding:4px 12px;
+  background:var(--card);
+  border-bottom:1px solid var(--border);
+  flex-shrink:0;
+  flex-wrap:wrap;
+}
+.ctrl{display:flex;flex-direction:column}
+.ctrl label{
+  font-size:11px;
+  font-weight:600;
+  color:#555;
+  margin-bottom:1px;
+}
+.ctrl select,.ctrl input{
+  font-size:13px;
+  padding:4px 8px;
+  border:1px solid #ccc;
+  border-radius:5px;
+  background:#fff;
+}
+.ctrl select{cursor:pointer}
+.ctrl input{width:170px}
+.city-a{color:var(--red)}
+.city-b{color:var(--purple)}
+
+.btn-row{
+  display:flex;
+  align-items:center;
+  gap:3px;
+}
+.btn-row button{
+  background:none;
+  border:none;
+  cursor:pointer;
+  font-size:20px;
+  padding:2px 5px;
+  border-radius:4px;
+  line-height:1;
+}
+.btn-row button:hover{background:#eee}
+
+#body{
+  display:flex;
+  flex:1;
+  min-height:0;
+}
+#map-col{
+  flex:3;
+  position:relative;
+  min-width:0;
+  min-height:0;
+}
+#map{
+  height:100%;
+  width:100%;
+}
+#legend{
+  position:absolute;
+  bottom:20px;
+  left:10px;
+  background:rgba(255,255,255,0.94);
+  padding:8px 12px;
+  border-radius:8px;
+  font-size:11px;
+  box-shadow:0 2px 6px rgba(0,0,0,0.18);
+  z-index:800;
+  pointer-events:none;
+}
+.grad{
+  height:12px;
+  width:180px;
+  border-radius:2px;
+  margin:4px 0;
+}
+.legend-labels{
+  display:flex;
+  justify-content:space-between;
+  font-size:10px;
+  color:#555;
+}
+
+/* ── Right panel (desktop: always visible) ── */
+#panel{
+  width:380px;
+  flex-shrink:0;
+  display:flex;
+  flex-direction:column;
+  background:#fafafa;
+  border-left:1px solid var(--border);
+  overflow-y:auto;
+}
+#panel-title{
+  text-align:center;
+  font-weight:700;
+  font-size:13px;
+  color:var(--text);
+  padding:8px 8px 4px;
+  min-height:20px;
+  line-height:1.3;
+}
+#chart-wrap{
+  flex:2;
+  min-height:520px;
+}
+#histo-wrap{
+  flex:1;
+  min-height:155px;
+  margin:0 6px 8px;
+  background:#f0f1f3;
+  border-radius:6px;
+}
+#stats{
+  text-align:center;
+  font-size:11px;
+  color:#666;
+  padding:2px 0;
+  background:var(--card);
+  border-top:1px solid #eee;
+  flex-shrink:0;
+}
+#footer{
+  text-align:center;
+  font-size:10px;
+  color:#999;
+  padding:3px 0;
+  background:var(--card);
+  border-top:1px solid var(--border);
+  flex-shrink:0;
+}
+#footer a{color:#777}
+
+/* ── Mobile toggle buttons ── */
+#mobile-view-switch{
+  display:none;
+  gap:8px;
+  padding:8px;
+  background:var(--card);
+  border-bottom:1px solid var(--border);
+}
+#mobile-view-switch button{
+  flex:1;
+  border:1px solid #ccc;
+  background:#fff;
+  border-radius:8px;
+  padding:8px 10px;
+  font-size:13px;
+  font-weight:600;
+  cursor:pointer;
+}
+#mobile-view-switch button.active{
+  background:#2c3e50;
+  color:#fff;
+  border-color:#2c3e50;
+}
+
+/* ── MOBILE: page scrolls naturally ── */
+@media(max-width:900px){
+  html,body{
+    height:auto;
+    overflow:auto;
+  }
+
+  #app{
+    display:block;
+    min-height:auto;
+  }
+
+  #mobile-view-switch{
+    display:flex;
+    position:sticky;
+    top:0;
+    z-index:950;
+  }
+
+  #body{
+    display:block;
+    height:auto;
+    min-height:0;
+    overflow:visible;
+  }
+
+  /* default mobile mode = stacked scrollable page */
+  #map-col{
+    width:100%;
+    height:55vh;
+    min-height:280px;
+  }
+
+  #map{
+    height:100%;
+    width:100%;
+  }
+
+  #panel{
+    width:100%;
+    display:block;
+    border-left:none;
+    border-top:1px solid var(--border);
+    overflow:visible;
+  }
+
+  #chart-wrap{
+    min-height:360px;
+  }
+
+  #histo-wrap{
+    min-height:180px;
+    margin:0 8px 10px;
+  }
+
+  #controls{
+    gap:8px;
+    padding:6px 8px;
+  }
+
+  .ctrl input{width:140px}
+  .ctrl select,.ctrl input{
+    font-size:12px;
+    padding:3px 6px;
+  }
+
+  /* optional one-panel-at-a-time mode on mobile */
+  body.mobile-show-map #map-col{display:block}
+  body.mobile-show-map #panel{display:none}
+
+  body.mobile-show-chart #map-col{display:none}
+  body.mobile-show-chart #panel{display:block}
+}
+
+@media(max-width:500px){
+  #controls{
+    flex-direction:column;
+    align-items:stretch;
+    gap:4px;
+  }
+  .ctrl{width:100%}
+  .ctrl input,.ctrl select{width:100%}
+  #header h1{font-size:16px}
+  #map-col{height:46vh;min-height:240px}
+}
 </style>
 </head>
-<body>
+<body class="mobile-show-map">
 
-<div id="header">
-  <h1>U.S. Climate Normals Map (1991–2020)</h1>
-</div>
+<div id="app">
+  <div id="header"><h1>U.S. Climate Normals Map (1991–2020)</h1></div>
 
-<div id="controls">
-  <div class="ctrl">
-    <label>Variable</label>
-    <select id="varSel"></select>
+  <div id="controls">
+    <div class="ctrl">
+      <label>Variable</label>
+      <select id="varSel"></select>
+    </div>
+    <div class="ctrl">
+      <label>Period</label>
+      <select id="moSel"></select>
+    </div>
+    <div class="ctrl">
+      <label>Units</label>
+      <select id="unitSel">
+        <option value="imp">°F / in / ft</option>
+        <option value="met">°C / mm / m</option>
+      </select>
+    </div>
+    <div class="ctrl">
+      <label class="city-a">City A</label>
+      <div class="btn-row">
+        <input id="searchA" list="cityList" placeholder="Click map or type...">
+        <button id="clearA" title="Clear A" style="color:var(--red)">×</button>
+        <button id="swapBtn" title="Swap A↔B">⇄</button>
+      </div>
+    </div>
+    <div class="ctrl">
+      <label class="city-b">City B (compare)</label>
+      <div class="btn-row">
+        <input id="searchB" list="cityList" placeholder="Optional...">
+        <button id="clearB" title="Clear B" style="color:var(--purple)">×</button>
+      </div>
+    </div>
+    <div class="ctrl">
+      <label>Click → </label>
+      <select id="clickMode" style="width:50px">
+        <option value="A">A</option>
+        <option value="B">B</option>
+      </select>
+    </div>
+    <datalist id="cityList"></datalist>
   </div>
-  <div class="ctrl">
-    <label>Period</label>
-    <select id="moSel"></select>
+
+  <div id="mobile-view-switch">
+    <button id="showMapBtn" class="active" type="button">Map</button>
+    <button id="showChartBtn" type="button">Charts</button>
   </div>
-  <div class="ctrl">
-    <label>Units</label>
-    <select id="unitSel">
-      <option value="imp">°F / in / ft</option>
-      <option value="met">°C / mm / m</option>
-    </select>
-  </div>
-  <div class="ctrl">
-    <label class="city-a">City A</label>
-    <div id="city-btns">
-      <input id="searchA" list="cityList" placeholder="Click map or type...">
-      <button id="clearA" title="Clear A" class="city-a">×</button>
-      <button id="swapBtn" title="Swap A↔B">⇄</button>
+
+  <div id="body">
+    <div id="map-col">
+      <div id="map"></div>
+      <div id="legend"></div>
+    </div>
+    <div id="panel">
+      <div id="panel-title">Click a region or search above</div>
+      <div id="chart-wrap"></div>
+      <div id="histo-wrap"></div>
     </div>
   </div>
-  <div class="ctrl">
-    <label class="city-b">City B (compare)</label>
-    <div id="city-btns">
-      <input id="searchB" list="cityList" placeholder="Optional...">
-      <button id="clearB" title="Clear B" class="city-b">×</button>
-    </div>
-  </div>
-  <div class="ctrl">
-    <label>Click assigns to</label>
-    <select id="clickMode"><option value="A">A</option><option value="B">B</option></select>
-  </div>
-  <datalist id="cityList"></datalist>
-</div>
 
-<div id="main">
-  <div id="map-wrap">
-    <div id="map"></div>
-    <div class="legend" id="legend"></div>
+  <div id="stats"></div>
+  <div id="footer">
+    Data: <a href="https://www.ncei.noaa.gov/products/land-based-station/us-climate-normals" target="_blank">NOAA 1991–2020 Climate Normals</a>
+    · City database: <a href="https://simplemaps.com/data/us-cities" target="_blank">SimpleMaps</a>
   </div>
-  <div id="panel">
-    <div id="panel-title">Click a region or search above</div>
-    <div id="chart"></div>
-    <div id="histogram"></div>
-  </div>
-</div>
-
-<div id="stats"></div>
-<div id="footer">
-  Data: <a href="https://www.ncei.noaa.gov/products/land-based-station/us-climate-normals" target="_blank">NOAA 1991–2020 Climate Normals</a>
-  · City database: <a href="https://simplemaps.com/data/us-cities" target="_blank">SimpleMaps</a>
 </div>
 
 <script>
-// ═══ EMBEDDED DATA (injected by build script) ═══
 const CITIES = %%CITIES_JSON%%;
 const VORONOI = %%VORONOI_JSON%%;
 
-// ═══ VARIABLE DEFINITIONS ═══
 const VARS = [
-  {k:"tavg",  label:"Mean Temp (°F)",         labelM:"Mean Temp (°C)",         scale:"RdBu_r", convF:v=>(v-32)*5/9},
-  {k:"tmax",  label:"Mean Max Temp (°F)",      labelM:"Mean Max Temp (°C)",      scale:"RdBu_r", convF:v=>(v-32)*5/9},
-  {k:"tmin",  label:"Mean Min Temp (°F)",      labelM:"Mean Min Temp (°C)",      scale:"RdBu_r", convF:v=>(v-32)*5/9},
+  {k:"tavg",  label:"Mean Temp (°F)",          labelM:"Mean Temp (°C)",          scale:"RdBu_r",  convF:v=>(v-32)*5/9},
+  {k:"tmax",  label:"Mean Max Temp (°F)",      labelM:"Mean Max Temp (°C)",      scale:"RdBu_r",  convF:v=>(v-32)*5/9},
+  {k:"tmin",  label:"Mean Min Temp (°F)",      labelM:"Mean Min Temp (°C)",      scale:"RdBu_r",  convF:v=>(v-32)*5/9},
   {k:"dutr",  label:"Diurnal Range (°F)",      labelM:"Diurnal Range (°C)",      scale:"Oranges", convF:v=>v*5/9},
   {k:"prcp",  label:"Precipitation (in)",      labelM:"Precipitation (mm)",      scale:"Blues",   convF:v=>v*25.4},
   {k:"snow",  label:"Snowfall (in)",           labelM:"Snowfall (mm)",           scale:"ice_r",   convF:v=>v*25.4},
@@ -414,277 +664,372 @@ const VARS = [
 ];
 const MONTHS = ["Annual","January","February","March","April","May","June",
                 "July","August","September","October","November","December"];
-const SMONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const SM = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
-// ═══ COLOR SCALES ═══
-// Pre-built color arrays for each named scale
 const SCALES = {
-  "RdBu_r":   [[0,"#053061"],[0.1,"#2166ac"],[0.2,"#4393c3"],[0.3,"#92c5de"],[0.4,"#d1e5f0"],
-               [0.5,"#f7f7f7"],[0.6,"#fddbc7"],[0.7,"#f4a582"],[0.8,"#d6604d"],[0.9,"#b2182b"],[1,"#67001f"]],
-  "Blues":    [[0,"#f7fbff"],[0.25,"#c6dbef"],[0.5,"#6baed6"],[0.75,"#2171b5"],[1,"#08306b"]],
-  "Reds":     [[0,"#fff5f0"],[0.25,"#fcbba1"],[0.5,"#fb6a4a"],[0.75,"#cb181d"],[1,"#67000d"]],
-  "Oranges":  [[0,"#fff5eb"],[0.25,"#fdd49e"],[0.5,"#fdae6b"],[0.75,"#e6550d"],[1,"#8c2d04"]],
-  "YlOrRd":   [[0,"#ffffcc"],[0.25,"#feb24c"],[0.5,"#fd8d3c"],[0.75,"#e31a1c"],[1,"#800026"]],
-  "YlOrBr":   [[0,"#ffffe5"],[0.25,"#fee391"],[0.5,"#fe9929"],[0.75,"#cc4c02"],[1,"#662506"]],
-  "ice_r":    [[0,"#08306b"],[0.25,"#2171b5"],[0.5,"#6baed6"],[0.75,"#c6dbef"],[1,"#f7fbff"]],
-  "RdYlGn":   [[0,"#a50026"],[0.25,"#f46d43"],[0.5,"#ffffbf"],[0.75,"#66bd63"],[1,"#006837"]],
-  "Viridis":  [[0,"#440154"],[0.25,"#31688e"],[0.5,"#35b779"],[0.75,"#90d743"],[1,"#fde725"]],
+  "RdBu_r":  [[0,"#053061"],[.1,"#2166ac"],[.2,"#4393c3"],[.3,"#92c5de"],[.4,"#d1e5f0"],
+              [.5,"#f7f7f7"],[.6,"#fddbc7"],[.7,"#f4a582"],[.8,"#d6604d"],[.9,"#b2182b"],[1,"#67001f"]],
+  "Blues":   [[0,"#f7fbff"],[.25,"#c6dbef"],[.5,"#6baed6"],[.75,"#2171b5"],[1,"#08306b"]],
+  "Reds":    [[0,"#fff5f0"],[.25,"#fcbba1"],[.5,"#fb6a4a"],[.75,"#cb181d"],[1,"#67000d"]],
+  "Oranges": [[0,"#fff5eb"],[.25,"#fdd49e"],[.5,"#fdae6b"],[.75,"#e6550d"],[1,"#8c2d04"]],
+  "YlOrRd":  [[0,"#ffffcc"],[.25,"#feb24c"],[.5,"#fd8d3c"],[.75,"#e31a1c"],[1,"#800026"]],
+  "YlOrBr":  [[0,"#ffffe5"],[.25,"#fee391"],[.5,"#fe9929"],[.75,"#cc4c02"],[1,"#662506"]],
+  "ice_r":   [[0,"#08306b"],[.25,"#2171b5"],[.5,"#6baed6"],[.75,"#c6dbef"],[1,"#f7fbff"]],
+  "RdYlGn":  [[0,"#a50026"],[.25,"#f46d43"],[.5,"#ffffbf"],[.75,"#66bd63"],[1,"#006837"]],
+  "Viridis": [[0,"#440154"],[.25,"#31688e"],[.5,"#35b779"],[.75,"#90d743"],[1,"#fde725"]],
 };
 
-function interpolateColor(scale, t) {
-  t = Math.max(0, Math.min(1, t));
-  let stops = SCALES[scale] || SCALES["Viridis"];
-  for (let i = 0; i < stops.length - 1; i++) {
-    if (t >= stops[i][0] && t <= stops[i+1][0]) {
-      let f = (t - stops[i][0]) / (stops[i+1][0] - stops[i][0]);
-      let c1 = stops[i][1], c2 = stops[i+1][1];
-      let r1=parseInt(c1.slice(1,3),16), g1=parseInt(c1.slice(3,5),16), b1=parseInt(c1.slice(5,7),16);
-      let r2=parseInt(c2.slice(1,3),16), g2=parseInt(c2.slice(3,5),16), b2=parseInt(c2.slice(5,7),16);
-      let r=Math.round(r1+f*(r2-r1)), g=Math.round(g1+f*(g2-g1)), b=Math.round(b1+f*(b2-b1));
-      return `rgb(${r},${g},${b})`;
+function lerpColor(scale,t){
+  t=Math.max(0,Math.min(1,t));
+  let S=SCALES[scale]||SCALES.Viridis;
+  for(let i=0;i<S.length-1;i++){
+    if(t>=S[i][0]&&t<=S[i+1][0]){
+      let f=(t-S[i][0])/(S[i+1][0]-S[i][0]),a=S[i][1],b=S[i+1][1];
+      let r1=parseInt(a.slice(1,3),16),g1=parseInt(a.slice(3,5),16),b1=parseInt(a.slice(5,7),16);
+      let r2=parseInt(b.slice(1,3),16),g2=parseInt(b.slice(3,5),16),b2=parseInt(b.slice(5,7),16);
+      return `rgb(${Math.round(r1+f*(r2-r1))},${Math.round(g1+f*(g2-g1))},${Math.round(b1+f*(b2-b1))})`;
     }
   }
-  return stops[stops.length-1][1];
+  return S[S.length-1][1];
 }
 
-// ═══ STATE ═══
+/* ── State ── */
 let map, geoLayer, cityA=null, cityB=null;
 
-// ═══ HELPERS ═══
-function getVar() { return VARS[document.getElementById("varSel").selectedIndex]; }
-function getMo()  { return parseInt(document.getElementById("moSel").value); }
-function isMetric(){ return document.getElementById("unitSel").value==="met"; }
-function getVal(city, varDef, mo) {
+/* ── Helpers ── */
+const $=id=>document.getElementById(id);
+function gv(){return VARS[$("varSel").selectedIndex]}
+function gm(){return +$("moSel").value}
+function met(){return $("unitSel").value==="met"}
+function isMobile(){return window.innerWidth<=900}
+
+function val(c,vd,mo){
   let v;
-  if (varDef.isElev) { v = city.el; }
-  else if (mo === 0) { v = city.a[varDef.k]; }
-  else { v = city.m[String(mo)] ? city.m[String(mo)][varDef.k] : null; }
-  if (v == null) return null;
-  if (isMetric() && varDef.convF) v = varDef.convF(v);
+  if(vd.isElev) v=c.el;
+  else if(mo===0) v=c.a[vd.k];
+  else v=c.m[String(mo)] ? c.m[String(mo)][vd.k] : null;
+  if(v==null) return null;
+  if(met() && vd.convF) v=vd.convF(v);
   return v;
 }
-function getLabel(varDef) { return isMetric() ? varDef.labelM : varDef.label; }
-function fmtElev(city) {
-  if (city.el == null) return "N/A";
-  return isMetric() ? `${Math.round(city.el*0.3048).toLocaleString()} m` : `${Math.round(city.el).toLocaleString()} ft`;
+function lab(vd){return met()?vd.labelM:vd.label}
+function elev(c){
+  if(c.el==null) return "N/A";
+  return met() ? `${Math.round(c.el*.3048).toLocaleString()} m`
+               : `${Math.round(c.el).toLocaleString()} ft`;
 }
-function cityKey(city) { return `${city.c}, ${city.s}`; }
+function ck(c){return `${c.c}, ${c.s}`}
+function findCity(k){return k ? CITIES.find(c=>ck(c)===k) || null : null}
 
-// ═══ INIT ═══
-function init() {
-  // Populate dropdowns
-  let varSel = document.getElementById("varSel");
-  VARS.forEach((v,i) => { let o=document.createElement("option"); o.value=i; o.textContent=v.label; varSel.appendChild(o); });
-  let moSel = document.getElementById("moSel");
-  MONTHS.forEach((m,i) => { let o=document.createElement("option"); o.value=i; o.textContent=m; moSel.appendChild(o); });
+/* ── Mobile view switch ── */
+function setMobileView(mode){
+  if(!isMobile()) return;
+  document.body.classList.remove("mobile-show-map","mobile-show-chart");
+  document.body.classList.add(mode==="chart" ? "mobile-show-chart" : "mobile-show-map");
+  $("showMapBtn").classList.toggle("active", mode!=="chart");
+  $("showChartBtn").classList.toggle("active", mode==="chart");
 
-  // City datalist
-  let dl = document.getElementById("cityList");
-  CITIES.forEach(c => { let o=document.createElement("option"); o.value=cityKey(c); dl.appendChild(o); });
+  setTimeout(()=>{
+    if(map) map.invalidateSize();
+    window.dispatchEvent(new Event("resize"));
+  }, 50);
+}
 
-  // Map
-  map = L.map("map",{zoomControl:true}).setView([39.5,-98.5],4);
+/* ── Init ── */
+function init(){
+  VARS.forEach((v,i)=>{
+    let o=document.createElement("option");
+    o.value=i;
+    o.textContent=v.label;
+    $("varSel").appendChild(o);
+  });
+
+  MONTHS.forEach((m,i)=>{
+    let o=document.createElement("option");
+    o.value=i;
+    o.textContent=m;
+    $("moSel").appendChild(o);
+  });
+
+  let dl=$("cityList");
+  CITIES.forEach(c=>{
+    let o=document.createElement("option");
+    o.value=ck(c);
+    dl.appendChild(o);
+  });
+
+  map=L.map("map",{zoomControl:true}).setView([39.5,-98.5],4);
   L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",{
-    attribution:'',maxZoom:18,subdomains:'abcd'
+    maxZoom:18,
+    subdomains:"abcd"
   }).addTo(map);
 
-  // GeoJSON layer
-  geoLayer = L.geoJSON(VORONOI, {
-    style: () => ({fillColor:"#ccc",fillOpacity:0.8,weight:0.5,color:"rgba(255,255,255,0.5)"}),
-    onEachFeature: (feature, layer) => {
-      let idx = feature.properties.i;
-      if (idx == null || idx >= CITIES.length) return;
-      layer.on("click", () => {
-        let mode = document.getElementById("clickMode").value;
-        if (mode === "A") { cityA = CITIES[idx]; document.getElementById("searchA").value = cityKey(CITIES[idx]); }
-        else              { cityB = CITIES[idx]; document.getElementById("searchB").value = cityKey(CITIES[idx]); }
+  geoLayer=L.geoJSON(VORONOI,{
+    style:()=>({fillColor:"#ccc",fillOpacity:.8,weight:.5,color:"rgba(255,255,255,.5)"}),
+    onEachFeature:(feat,layer)=>{
+      let idx=feat.properties.i;
+      if(idx==null || idx>=CITIES.length) return;
+
+      layer.on("click",()=>{
+        let m=$("clickMode").value;
+        if(m==="A"){
+          cityA=CITIES[idx];
+          $("searchA").value=ck(CITIES[idx]);
+        }else{
+          cityB=CITIES[idx];
+          $("searchB").value=ck(CITIES[idx]);
+        }
         updateAll();
+
+        if(isMobile()){
+          setMobileView("chart");
+          document.getElementById("panel").scrollIntoView({behavior:"smooth", block:"start"});
+        }
       });
-      layer.on("mouseover", e => { e.target.setStyle({weight:2,color:"#333"}); });
-      layer.on("mouseout",  e => { geoLayer.resetStyle(e.target); updateMapColors(); });
+
+      layer.on("mouseover",e=>e.target.setStyle({weight:2,color:"#333"}));
+      layer.on("mouseout",e=>{
+        geoLayer.resetStyle(e.target);
+        paintMap();
+      });
     }
   }).addTo(map);
 
-  // Event listeners
-  ["varSel","moSel","unitSel"].forEach(id => document.getElementById(id).addEventListener("change", updateAll));
-  document.getElementById("searchA").addEventListener("change", e => { cityA=findCity(e.target.value); updateAll(); });
-  document.getElementById("searchB").addEventListener("change", e => { cityB=findCity(e.target.value); updateAll(); });
-  document.getElementById("clearA").addEventListener("click", () => { cityA=null; document.getElementById("searchA").value=""; updateAll(); });
-  document.getElementById("clearB").addEventListener("click", () => { cityB=null; document.getElementById("searchB").value=""; updateAll(); });
-  document.getElementById("swapBtn").addEventListener("click", () => {
-    [cityA,cityB]=[cityB,cityA];
-    document.getElementById("searchA").value=cityA?cityKey(cityA):"";
-    document.getElementById("searchB").value=cityB?cityKey(cityB):"";
+  ["varSel","moSel","unitSel"].forEach(id=>$(id).addEventListener("change",updateAll));
+
+  $("searchA").addEventListener("change",e=>{
+    cityA=findCity(e.target.value);
     updateAll();
   });
 
+  $("searchB").addEventListener("change",e=>{
+    cityB=findCity(e.target.value);
+    updateAll();
+  });
+
+  $("clearA").addEventListener("click",()=>{
+    cityA=null;
+    $("searchA").value="";
+    updateAll();
+  });
+
+  $("clearB").addEventListener("click",()=>{
+    cityB=null;
+    $("searchB").value="";
+    updateAll();
+  });
+
+  $("swapBtn").addEventListener("click",()=>{
+    [cityA,cityB]=[cityB,cityA];
+    $("searchA").value=cityA?ck(cityA):"";
+    $("searchB").value=cityB?ck(cityB):"";
+    updateAll();
+  });
+
+  $("showMapBtn").addEventListener("click",()=>setMobileView("map"));
+  $("showChartBtn").addEventListener("click",()=>setMobileView("chart"));
+
+  window.addEventListener("resize",()=>{
+    if(map) map.invalidateSize();
+    if(!isMobile()){
+      document.body.classList.remove("mobile-show-map","mobile-show-chart");
+      $("showMapBtn").classList.add("active");
+      $("showChartBtn").classList.remove("active");
+    }else if(
+      !document.body.classList.contains("mobile-show-map") &&
+      !document.body.classList.contains("mobile-show-chart")
+    ){
+      setMobileView("map");
+    }
+  });
+
+  if(isMobile()) setMobileView("map");
   updateAll();
 }
 
-function findCity(key) {
-  if (!key) return null;
-  return CITIES.find(c => cityKey(c) === key) || null;
+function updateAll(){
+  paintMap();
+  paintChart();
+  paintHisto();
 }
 
-// ═══ UPDATE ALL ═══
-function updateAll() {
-  updateMapColors();
-  updateChart();
-  updateHistogram();
-}
+/* ── Map ── */
+function paintMap(){
+  let vd=gv(), mo=gm();
+  let vals=CITIES.map(c=>val(c,vd,mo)).filter(v=>v!=null);
+  if(!vals.length) return;
 
-// ═══ MAP COLORING ═══
-function updateMapColors() {
-  let varDef = getVar(), mo = getMo();
-  let vals = CITIES.map(c => getVal(c, varDef, mo)).filter(v => v != null);
-  if (!vals.length) return;
-  vals.sort((a,b) => a-b);
-  let vmin = vals[Math.floor(vals.length*0.02)];
-  let vmax = vals[Math.ceil(vals.length*0.98)-1];
-  if (vmin === vmax) { vmin -= 1; vmax += 1; }
-  let range = vmax - vmin;
+  vals.sort((a,b)=>a-b);
+  let lo=vals[Math.floor(vals.length*.02)],
+      hi=vals[Math.ceil(vals.length*.98)-1];
+  if(lo===hi){lo-=1;hi+=1}
+  let rng=hi-lo;
 
-  geoLayer.eachLayer(layer => {
-    let idx = layer.feature.properties.i;
-    if (idx == null || idx >= CITIES.length) return;
-    let v = getVal(CITIES[idx], varDef, mo);
-    let color = v != null ? interpolateColor(varDef.scale, (v-vmin)/range) : "#ddd";
+  geoLayer.eachLayer(ly=>{
+    let idx=ly.feature.properties.i;
+    if(idx==null || idx>=CITIES.length) return;
 
-    // Highlight selected cities
-    let isA = cityA && idx === CITIES.indexOf(cityA);
-    let isB = cityB && idx === CITIES.indexOf(cityB);
-    let w = (isA||isB) ? 3 : 0.5;
-    let bc = isA ? "#d32f2f" : isB ? "#7b1fa2" : "rgba(255,255,255,0.5)";
+    let v=val(CITIES[idx],vd,mo);
+    let fc=v!=null ? lerpColor(vd.scale,(v-lo)/rng) : "#ddd";
+    let isA=cityA && idx===CITIES.indexOf(cityA);
+    let isB=cityB && idx===CITIES.indexOf(cityB);
 
-    layer.setStyle({fillColor:color, fillOpacity:0.82, weight:w, color:bc});
+    ly.setStyle({
+      fillColor:fc,
+      fillOpacity:.82,
+      weight:isA||isB?3:.5,
+      color:isA?"var(--red)":isB?"var(--purple)":"rgba(255,255,255,.5)"
+    });
 
-    // Tooltip
-    let city = CITIES[idx];
-    let vs = v != null ? v.toFixed(1) : "N/A";
-    layer.bindTooltip(`<b>${city.c}, ${city.s}</b><br>${getLabel(varDef)}: ${vs}<br>Elev: ${fmtElev(city)}<br>Pop: ${city.p.toLocaleString()}`,
-      {sticky:true, className:"leaflet-tooltip"});
+    let c=CITIES[idx], vs=v!=null ? v.toFixed(1) : "N/A";
+    ly.bindTooltip(
+      `<b>${c.c}, ${c.s}</b><br>${lab(vd)}: ${vs}<br>Elev: ${elev(c)}<br>Pop: ${c.p.toLocaleString()}`,
+      {sticky:true}
+    );
   });
 
-  // Legend
-  let lg = document.getElementById("legend");
-  let stops = SCALES[varDef.scale] || SCALES["Viridis"];
-  let gradColors = stops.map(s => s[1]).join(",");
-  lg.innerHTML = `<div style="font-weight:600;margin-bottom:2px">${getLabel(varDef)} — ${MONTHS[mo]}</div>
-    <div class="grad" style="background:linear-gradient(to right,${gradColors})"></div>
-    <div class="labels"><span>${vmin.toFixed(1)}</span><span>${vmax.toFixed(1)}</span></div>`;
+  let stops=SCALES[vd.scale]||SCALES.Viridis;
+  let grad=stops.map(s=>s[1]).join(",");
+  $("legend").innerHTML = `
+    <div style="font-weight:600;margin-bottom:2px">${lab(vd)} — ${MONTHS[mo]}</div>
+    <div class="grad" style="background:linear-gradient(to right,${grad})"></div>
+    <div class="legend-labels"><span>${lo.toFixed(1)}</span><span>${hi.toFixed(1)}</span></div>
+  `;
 
-  // Stats
-  let mean = vals.reduce((a,b)=>a+b,0)/vals.length;
-  let median = vals[Math.floor(vals.length/2)];
-  document.getElementById("stats").textContent =
-    `${vals.length} cities · Min: ${vals[0].toFixed(1)} · Mean: ${mean.toFixed(1)} · Median: ${median.toFixed(1)} · Max: ${vals[vals.length-1].toFixed(1)}`;
+  let mean=vals.reduce((a,b)=>a+b,0)/vals.length;
+  let med=vals[Math.floor(vals.length/2)];
+  $("stats").textContent =
+    `${vals.length} cities · Min: ${vals[0].toFixed(1)} · Mean: ${mean.toFixed(1)} · Median: ${med.toFixed(1)} · Max: ${vals[vals.length-1].toFixed(1)}`;
 }
 
-// ═══ CHART ═══
-function updateChart() {
-  let unit = isMetric();
-  let mo = getMo();
+/* ── Chart ── */
+function paintChart(){
+  let u=met(), mo=gm();
 
-  if (!cityA && !cityB) {
-    Plotly.react("chart",[],{
-      paper_bgcolor:"#fafafa",plot_bgcolor:"#fafafa",
-      xaxis:{visible:false},yaxis:{visible:false},
-      annotations:[{text:"Click a region or search",xref:"paper",yref:"paper",x:0.5,y:0.5,showarrow:false,font:{size:14,color:"#aaa"}}],
-      margin:{l:10,r:10,t:10,b:10}
-    });
-    document.getElementById("panel-title").textContent = "Click a region or search above";
+  if(!cityA && !cityB){
+    Plotly.react("chart-wrap",[],{
+      paper_bgcolor:"#fafafa",
+      plot_bgcolor:"#fafafa",
+      xaxis:{visible:false},
+      yaxis:{visible:false},
+      annotations:[{
+        text:"Click a region or search",
+        xref:"paper",yref:"paper",x:.5,y:.5,
+        showarrow:false,font:{size:14,color:"#aaa"}
+      }],
+      margin:{l:10,r:10,t:10,b:10},
+      height:isMobile()?340:400
+    },{responsive:true});
+
+    $("panel-title").textContent="Click a region or search above";
     return;
   }
 
-  let traces = [];
-  let titleParts = [];
-  let colorsA = ["#d32f2f","#f57c00","#1976d2"];
-  let colorsB = ["#7b1fa2","#388e3c","#00acc1"];
-  let comparing = cityA && cityB;
+  let traces=[], titles=[], cmp=cityA&&cityB;
+  let cA=["#d32f2f","#f57c00","#1976d2"], cB=["#7b1fa2","#388e3c","#00acc1"];
 
-  function addTraces(city, colors, pfx, dash) {
-    let tmax=[],tavg=[],tmin=[],frost=[],hot=[];
-    for (let m=1;m<=12;m++) {
-      let d = city.m[String(m)] || {};
-      let mx=d.tmax, av=d.tavg, mn=d.tmin;
-      if (unit && mx!=null) mx=(mx-32)*5/9;
-      if (unit && av!=null) av=(av-32)*5/9;
-      if (unit && mn!=null) mn=(mn-32)*5/9;
-      tmax.push(mx); tavg.push(av); tmin.push(mn);
-      frost.push(d.frost); hot.push(d.hot90);
+  function add(city,col,pfx,dash){
+    let mx=[], av=[], mn=[], fr=[], ht=[];
+    for(let m=1;m<=12;m++){
+      let d=city.m[String(m)]||{};
+      let a=d.tmax,b=d.tavg,c=d.tmin;
+      if(u&&a!=null)a=(a-32)*5/9;
+      if(u&&b!=null)b=(b-32)*5/9;
+      if(u&&c!=null)c=(c-32)*5/9;
+      mx.push(a); av.push(b); mn.push(c); fr.push(d.frost); ht.push(d.hot90);
     }
-    let tu = unit?"°C":"°F";
-    let nm = pfx ? pfx+" " : "";
-    traces.push({x:SMONTHS,y:tmax,name:`${nm}Max (${tu})`,type:"scatter",mode:"lines+markers",
-      line:{color:colors[0],width:2.5,dash:dash||"solid"},marker:{size:4},xaxis:"x",yaxis:"y",legendgroup:pfx});
-    traces.push({x:SMONTHS,y:tavg,name:`${nm}Mean (${tu})`,type:"scatter",mode:"lines+markers",
-      line:{color:colors[1],width:2.5,dash:"dot"},marker:{size:4},xaxis:"x",yaxis:"y",legendgroup:pfx});
-    traces.push({x:SMONTHS,y:tmin,name:`${nm}Min (${tu})`,type:"scatter",mode:"lines+markers",
-      line:{color:colors[2],width:2.5,dash:dash||"solid"},marker:{size:4},xaxis:"x",yaxis:"y",legendgroup:pfx});
-    traces.push({x:SMONTHS,y:frost,name:`${nm}Freeze`,type:"bar",
-      marker:{color:colors[2],opacity:0.7},xaxis:"x2",yaxis:"y2",legendgroup:pfx});
-    traces.push({x:SMONTHS,y:hot,name:`${nm}90°F+`,type:"bar",
-      marker:{color:colors[0],opacity:0.6},xaxis:"x2",yaxis:"y2",legendgroup:pfx});
-
-    let el = fmtElev(city);
-    titleParts.push(`${city.c}, ${city.s} (${el})`);
+    let tu=u?"°C":"°F", nm=pfx ? pfx+" " : "";
+    traces.push({x:SM,y:mx,name:`${nm}Max (${tu})`,type:"scatter",mode:"lines+markers",
+      line:{color:col[0],width:2.5,dash:dash||"solid"},marker:{size:4},xaxis:"x",yaxis:"y",legendgroup:pfx});
+    traces.push({x:SM,y:av,name:`${nm}Mean (${tu})`,type:"scatter",mode:"lines+markers",
+      line:{color:col[1],width:2.5,dash:"dot"},marker:{size:4},xaxis:"x",yaxis:"y",legendgroup:pfx});
+    traces.push({x:SM,y:mn,name:`${nm}Min (${tu})`,type:"scatter",mode:"lines+markers",
+      line:{color:col[2],width:2.5,dash:dash||"solid"},marker:{size:4},xaxis:"x",yaxis:"y",legendgroup:pfx});
+    traces.push({x:SM,y:fr,name:`${nm}Freeze`,type:"bar",
+      marker:{color:col[2],opacity:.7},xaxis:"x2",yaxis:"y2",legendgroup:pfx});
+    traces.push({x:SM,y:ht,name:`${nm}90°F+`,type:"bar",
+      marker:{color:col[0],opacity:.6},xaxis:"x2",yaxis:"y2",legendgroup:pfx});
+    titles.push(`${city.c}, ${city.s} (${elev(city)})`);
   }
 
-  if (cityA) addTraces(cityA, colorsA, comparing?cityA.c:"", null);
-  if (cityB) addTraces(cityB, colorsB, comparing?cityB.c:"", comparing?"dash":null);
+  if(cityA) add(cityA,cA,cmp?cityA.c:"",null);
+  if(cityB) add(cityB,cB,cmp?cityB.c:"",cmp?"dash":null);
 
-  // Month highlight line
-  let shapes = [];
-  if (mo >= 1) {
-    let xp = SMONTHS[mo-1];
-    shapes.push({type:"line",x0:xp,x1:xp,y0:0,y1:1,yref:"paper",line:{color:"rgba(0,0,0,0.4)",width:2,dash:"dot"}});
+  let shapes=[];
+  if(mo>=1){
+    shapes.push({
+      type:"line",
+      x0:SM[mo-1],x1:SM[mo-1],y0:0,y1:1,yref:"paper",
+      line:{color:"rgba(0,0,0,.35)",width:2,dash:"dot"}
+    });
   }
 
-  let yRange = unit ? [-29,49] : [-20,120];
-  Plotly.react("chart", traces, {
-    grid:{rows:2,columns:1,pattern:"independent",roworder:"top to bottom",ygap:0.1},
-    yaxis:{title:unit?"°C":"°F",range:yRange,anchor:"x",domain:[0.45,0.75]},
-    xaxis:{anchor:"y"},yaxis:{title:unit?"°C":"°F",range:yRange,anchor:"x"},
-    xaxis2:{anchor:"y2"},yaxis2:{title:"Days",anchor:"x2"},
-    paper_bgcolor:"#fafafa",plot_bgcolor:"#fff",
-    margin:{l:50,r:10,t:30,b:30},
-    legend:{font:{size:9},orientation:"h",y:1.2,x:0.5,xanchor:"center"},
-    barmode:"group",font:{size:10},shapes:shapes,
+  let yr=u?[-29,49]:[-20,120];
+
+  Plotly.react("chart-wrap",traces,{
+    grid:{rows:2,columns:1,pattern:"independent",roworder:"top to bottom",ygap:.18},
+    xaxis:{anchor:"y"},
+    yaxis:{title:u?"°C":"°F",range:yr,anchor:"x",domain:[.42,.87]},
+    xaxis2:{anchor:"y2"},
+    yaxis2:{title:"Days",anchor:"x2",domain:[0,.3]},
+    paper_bgcolor:"#fafafa",
+    plot_bgcolor:"#fff",
+    margin:{l:44,r:8,t:50,b:28},
+    legend:{font:{size:8},orientation:"h",y:1,x:.5,xanchor:"center",yanchor:"bottom"},
+    barmode:"group",
+    font:{size:10},
+    shapes:shapes,
+    height:isMobile()?360:520
   },{responsive:true});
 
-  document.getElementById("panel-title").textContent = comparing ? titleParts.join("  vs  ") : titleParts[0]||"";
+  $("panel-title").textContent = cmp ? titles.join("  vs  ") : (titles[0]||"");
 }
 
-// ═══ HISTOGRAM ═══
-function updateHistogram() {
-  let varDef = getVar(), mo = getMo();
-  let vals = CITIES.map(c => getVal(c, varDef, mo)).filter(v => v != null);
+/* ── Histogram ── */
+function paintHisto(){
+  let vd=gv(), mo=gm();
+  let vals=CITIES.map(c=>val(c,vd,mo)).filter(v=>v!=null);
 
-  let traces = [{x:vals,type:"histogram",nbinsx:50,marker:{color:"#90caf9",line:{width:1,color:"white"}},showlegend:false}];
-  let shapes = [];
+  let traces=[{
+    x:vals,
+    type:"histogram",
+    nbinsx:50,
+    marker:{color:"#90caf9",line:{width:1,color:"white"}},
+    showlegend:false
+  }];
 
-  [[cityA,"#d32f2f"],[cityB,"#7b1fa2"]].forEach(([city,col]) => {
-    if (!city) return;
-    let v = getVal(city, varDef, mo);
-    if (v != null) shapes.push({type:"line",x0:v,x1:v,y0:0,y1:1,yref:"paper",line:{color:col,width:3,dash:"dash"}});
+  let shapes=[];
+  [[cityA,"#d32f2f"],[cityB,"#7b1fa2"]].forEach(([c,col])=>{
+    if(!c) return;
+    let v=val(c,vd,mo);
+    if(v!=null){
+      shapes.push({
+        type:"line",
+        x0:v,x1:v,y0:0,y1:1,yref:"paper",
+        line:{color:col,width:3,dash:"dash"}
+      });
+    }
   });
 
-  Plotly.react("histogram", traces, {
-    title:{text:`National Distribution: ${getLabel(varDef)}`,font:{size:11,color:"#2c3e50"}},
-    margin:{l:10,r:10,t:28,b:20},paper_bgcolor:"#f0f1f3",plot_bgcolor:"#f0f1f3",
-    xaxis:{title:getLabel(varDef),titlefont:{size:10},tickfont:{size:9}},
-    yaxis:{visible:false},shapes:shapes,
+  Plotly.react("histo-wrap",traces,{
+    title:{text:`Distribution: ${lab(vd)}`,font:{size:11,color:"#2c3e50"}},
+    margin:{l:10,r:10,t:26,b:20},
+    paper_bgcolor:"#f0f1f3",
+    plot_bgcolor:"#f0f1f3",
+    xaxis:{title:lab(vd),titlefont:{size:10},tickfont:{size:9}},
+    yaxis:{visible:false},
+    shapes:shapes,
+    height:isMobile()?180:155
   },{responsive:true});
 }
 
-// ═══ START ═══
-document.addEventListener("DOMContentLoaded", init);
+document.addEventListener("DOMContentLoaded",init);
 </script>
 </body>
 </html>'''
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MAIN — BUILD
+# MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -699,9 +1044,18 @@ if __name__ == "__main__":
     ann = merged[merged["month"]==0].reset_index(drop=True)
     vor_gj = build_voronoi(ann["lat"].values, ann["lng"].values, us_border)
 
+    # Cache processed data
+    base = os.path.dirname(CITIES_CSV)
+    try:
+        merged.to_parquet(os.path.join(base, "climate_merged.parquet"))
+        with open(os.path.join(base, "voronoi_cells.geojson"), "w") as f:
+            json.dump(vor_gj, f)
+        print("  Cached parquet + geojson.")
+    except Exception as e:
+        print(f"  Cache write failed: {e}")
+
     cities_json = build_json_data(merged)
 
-    # Build HTML
     print("Writing HTML...")
     html_out = HTML_TEMPLATE.replace("%%CITIES_JSON%%", json.dumps(cities_json, separators=(",",":")))
     html_out = html_out.replace("%%VORONOI_JSON%%", json.dumps(vor_gj, separators=(",",":")))
@@ -712,9 +1066,6 @@ if __name__ == "__main__":
         f.write(html_out)
 
     size_mb = os.path.getsize(out_path) / 1024 / 1024
-    print(f"\n✓ Generated: {out_path}")
-    print(f"  Size: {size_mb:.1f} MB")
-    print(f"  Cities: {len(cities_json)}")
-    print(f"  Voronoi cells: {len(vor_gj['features'])}")
+    print(f"\n  Generated: {out_path}")
+    print(f"  Size: {size_mb:.1f} MB  |  Cities: {len(cities_json)}  |  Cells: {len(vor_gj['features'])}")
     print(f"\n  Double-click the HTML file to open in your browser.")
-    print(f"  Or run:  python launch.pyw")
